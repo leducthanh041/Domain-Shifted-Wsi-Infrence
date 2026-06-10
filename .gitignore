@@ -1,0 +1,118 @@
+# ---------------------------------------------------------------------------
+# Python caches
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------------------
+# Virtual environments and local tool state
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.codex/
+.agents/
+AGENTS.md
+
+# ---------------------------------------------------------------------------
+# Editor, OS, and notebook noise
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.ipynb_checkpoints/
+notebooks/__pycache__/
+notebooks/.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# Hot-write outputs. In this repo these are normally symlinks to /docker.
+# ---------------------------------------------------------------------------
+/logs
+/logs*/
+/checkpoints
+/checkpoints_ood
+/checkpoints_test/
+/results/
+/runs/
+/outputs/
+/wandb/
+
+# ---------------------------------------------------------------------------
+# Model artifacts and experiment outputs
+# ---------------------------------------------------------------------------
+ckpts_outputs_finetuning_task_*.pt
+merged_weight_opcm_random_sampling_*.pth
+*.ckpt
+*.pth
+*.pt
+!task_prompts.pt
+
+# ---------------------------------------------------------------------------
+# Temporary files, archives, and NFS leftovers
+# ---------------------------------------------------------------------------
+*.tmp
+*.temp
+*.bak
+*.bak_*
+*.orig
+*.swp
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+.nfs*
+configs/.nfs*
+
+# ---------------------------------------------------------------------------
+# Notebook/generated helper artifacts
+# ---------------------------------------------------------------------------
+notebooks/*.bak*
+notebooks/*.tmp
+notebooks/*.temp
+notebooks/*.zip
+notebooks/*.tar
+notebooks/*.tar.gz
+notebooks/*.tgz
+notebooks/*_manifest.csv
+notebooks/*_skipped*.csv
+notebooks/*_cleanup_*.csv
+notebooks/slurm-*.out
+
+# ---------------------------------------------------------------------------
+# Local legacy or external workspaces kept out of the clean codebase
+# ---------------------------------------------------------------------------
+ASlide/
+PrePATH/
+TRIDENT/
+log/
+old_code_tta/
+old_scripts_tta/
+old_code_mergeslide/
+related_work/
+checkpoints_nfs_backup_*/
+docs_old/
+
+# ---------------------------------------------------------------------------
+# One-off local maintenance scripts
+# ---------------------------------------------------------------------------
+cleanup_rcc_corrupt_trident_outputs.py
+clear_folder.py
+convert_trident_h5_to_pt.py
+create_trident_mpp_csv.py
+flatten_wsi_dataset.py
+zip_tcga_datasets.py
+tune_tta_grid_search.py
+tune_tta_grid_search.sh
+
+# ---------------------------------------------------------------------------
+# Invalid or backup shell files
+# ---------------------------------------------------------------------------
+*.sh.bak*
+BRCA.sh.bak_invalid_utf8
+CESC.sh.bak_pre_mpp_filter
