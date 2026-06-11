@@ -1,189 +1,151 @@
-# [WACV 2026] MergeSlide: Continual Model Merging and Task-to-Class Prompt-Aligned Inference for Lifelong Learning on Whole Slide Images
+# MergeSlide-TTA
 
-<p align="center">
-  <a href="https://arxiv.org/abs/2511.13099"><img src="https://img.shields.io/badge/arXiv-2511.13099-b31b1b.svg" alt="Arxiv"></a>
-  <a href="https://wacv.thecvf.com/"><img src="https://img.shields.io/badge/WACV-2026-blue.svg" alt="WACV2026"></a>
-</p>
-
-> Doanh C. Bui (NAIST)*, Ba Hung Ngo (CNU), Hoai Luan Pham (NAIST), Khang Nguyen (UIT), Maï K. Nguyen (ETIS), Yasuhiko Nakashima (NAIST)
-
-<img width="1428" height="580" alt="{285A97E6-9C0D-485C-B01E-DB1C802FDCEE}" src="https://github.com/user-attachments/assets/c16c4012-4789-457f-a3f3-f21482eb7bbd" />
-
-## 📌 Status Updates
-
-![update](https://img.shields.io/badge/2026--xx--xx-TODO-blue) Clean the code.
-
-![update](https://img.shields.io/badge/2026--01--27-DONE-green) Update checkpoints for main results (Table 2).
-
-![update](https://img.shields.io/badge/2025--12--29-DONE-green) Released pre-processed TCGA WSI features.
-
-![update](https://img.shields.io/badge/2025--11--15-DONE-green) Release source code.
-
-![update](https://img.shields.io/badge/2025--11--11-DONE-green) Accepted by **WACV2026**.
+MergeSlide-TTA is a test-time adaptation extension for MergeSlide on whole-slide image inference.  
+The method follows the MergeSlide-TTA research idea and adapts the merged model at test time by updating selected LayerNorm affine parameters, while keeping the merging structure and prompt embeddings frozen.
 
 ## 1. Requirements
 
-- transformers=4.56.2
-- torch=2.5.1
-- torchaudio=2.5.1
-- torchvision=0.20.1
-- tqdm=4.67.1
-- transformers=4.56.2
+Install the runtime stack used by this repo:
 
-## 1.1. Project Structure
-
+```text
+numpy
+pandas
+scipy
+scikit-learn
+h5py
+tqdm
+omegaconf
+torch
+torchvision
+transformers
+matplotlib
+seaborn
+tensorboard
 ```
-MergeSlide_TTA/
+
+See `requirements.txt` for the full list.
+
+## 2. Project Structure
+
+```text
+MergeSlide_TTA_v1/
 ├── README.md
-├── task_prompts.pt
-├── train_random_sampling.py
-├── opcm_mergeslide.py
-├── test_classIL_task_prompt.py
-├── test_classIL_task_prompt_other_metrics.py
-├── test_taskIL.py
+├── docs/
 ├── mergeslide_tta/
 │   ├── __init__.py
+│   ├── constants.py
 │   ├── datasets.py
+│   ├── metrics.py
+│   ├── model.py
 │   ├── prompts_zeroshot.py
+│   ├── tta_adapter.py
+│   ├── tta_losses.py
 │   └── utils.py
-└── notebooks/
-    └── WSI_processing.ipynb
+├── scripts/
+│   ├── test_classIL.sh
+│   ├── test_classIL_tta.sh
+│   ├── test_taskIL.sh
+│   └── test_taskIL_tta.sh
+├── checkpoints -> /docker/data/thanhld/MergeSlide_TTA_v1/checkpoints
+├── checkpoints_ood -> /docker/data/thanhld/MergeSlide_TTA_v1/checkpoints_ood
+├── logs -> /docker/data/thanhld/MergeSlide_TTA_v1/logs
+├── merge.py
+├── opcm_mergeslide.py
+├── task_prompts.pt
+├── test_classIL_task_prompt.py
+├── test_classIL_task_prompt_other_metrics.py
+├── test_classIL_tta.py
+├── test_taskIL.py
+├── test_taskIL_tta.py
+├── train.py
+└── tools/
+    └── run_classil_with_pt_features.py
 ```
 
-- Root-level scripts remain the CLI entrypoints.
-- Shared modules now live under `mergeslide_tta/`.
-- `task_prompts.pt` stays at the project root because it is an evaluation artifact.
+## 3. Datasets
 
-## 2. Datasets
+The experiments use six TCGA tasks:
 
-### 2.1. Access Datasets
+- TCGA-BRCA
+- TCGA-RCC
+- TCGA-NSCLC
+- TCGA-ESCA
+- TCGA-TGCT
+- TCGA-CESC
 
-We use a stream of six datasets TCGA-BRCA, TCGA-NSCLC, TCGA-RCC, TCGA-ESCA, TCGA-TGCT and TCGA-CESC in this study.
+### Data preparation
 
-For dataset preparation, you may need to download the WSIs from the TCGA portal and process them (patch extraction + feature extraction using TITAN’s vision encoder). If you are not familiar with this procedure, please refer to `notebooks/WSI_processing.ipynb`.
+Prepare WSI annotations and pre-extracted features, then point `mergeslide_tta/datasets.py` to the local dataset root. BRCA, RCC, and NSCLC use CSV-based split metadata; ESCA, TGCT, and CESC use the simplified directory-based format already supported by the repo.
 
-For convenience, we also provide pre-processed features that can be used directly with the scripts below.
+## 4. Implementation
 
-- Data annotation and WSI features: Updating.
+### 4.1. Base MergeSlide workflow
 
-### 2.2. Data Preparation
+Per-task finetuning:
 
-For dataset preparation, ESCA, TGCT, and CESC have a slightly different format compared with BRCA, NSCLC, and RCC. Therefore, two separate Python classes are defined for these groups. However, for both training and inference, we only need to prepare the data paths in `mergeslide_tta/datasets.py` as follows (in `Sequential_Generic_MIL_Dataset` class):
-
-```[python3]
-datasets = [Generic_MIL_Dataset(csv_path='/path/to/dataset/wsi_dataset_annotation/tcga_brca/tcga_brca_subset.csv.zip', data_dir='/path/to/dataset/TCGA-BRCA_processed/features/', shuffle=False, seed=0, print_info=True, label_dict={'IDC': 0, 'ILC': 1}, patient_strat=False, ignore=['MDLC', 'PD', 'ACBC', 'IMMC', 'BRCNOS', 'BRCA', 'SPC', 'MBC', 'MPT']), 
-                Generic_MIL_Dataset(csv_path='/path/to/dataset/wsi_dataset_annotation/tcga_rcc/tcga_kidney_subset.csv.zip', data_dir='/path/to/dataset/TCGA-RCC_processed/features/', shuffle=False, seed=0, print_info=True, label_dict={'CCRCC': 0, 'PRCC': 1, 'CHRCC': 2}, patient_strat=False, ignore=[]), 
-                Generic_MIL_Dataset(csv_path='/path/to/dataset/wsi_dataset_annotation/tcga_nsclc/tcga_lung_subset.csv.zip', data_dir='/path/to/dataset/TCGA-NSCLC_processed/features/', shuffle=False, seed=0, print_info=True, label_dict={'LUAD': 0, 'LUSC': 1}, patient_strat=False, ignore=[]), 
-                Generic_MIL_Dataset2(data_dir='/path/to/dataset/TCGA-ESCA_processed/features/', label_dict={0: 0, 1: 1}), 
-                Generic_MIL_Dataset2(data_dir='/path/to/dataset/TCGA-TGCT_processed/features/', label_dict={0: 0, 1: 1}), 
-                Generic_MIL_Dataset2(data_dir='/path/to/dataset/TCGA-CESC_processed/features/', label_dict={0: 0, 1: 1})]
-    
-split_dirs = ['/path/to/dataset/wsi_dataset_annotation/tcga_brca',
-                '/path/to/dataset/wsi_dataset_annotation/tcga_rcc', 
-                '/path/to/dataset/wsi_dataset_annotation/tcga_nsclc', 
-                '/path/to/dataset/wsi_dataset_annotation/tcga_esca', 
-                '/path/to/dataset/wsi_dataset_annotation/tcga_tgct', 
-                '/path/to/dataset/wsi_dataset_annotation/tcga_cesc']
+```bash
+bash scripts/finetune.sh
 ```
 
-In this setup, `/path/to/dataset` refers to the root directory of the dataset. The `wsi_dataset_annotation` file and all feature directories under `/TCGA-*_processed/features` are provided in **Section 2.1: Access Datasets**.
+Model merging:
 
-## 3. Implementation
-
-As described in the paper, we first define class-aware prompts to describe a set of class labels (**Class-aware Prompt Design**), get their embeddings using TITAN's text encoder, and train each model on its corresponding TCGA task using the pre-trained weights of TITAN’s slide aggregator (**Per-task finetuning**). We then merge these models using a continual model-merging method (**Model merging**).
-
-**Note:** You may need to be granted to access TITAN pre-trained slide aggregator by yourself. Please visit https://huggingface.co/MahmoodLab/TITAN.
-
-### 3.1. Class-aware Prompt Design
-
-For the six tasks in this study, please refer to `mergeslide_tta/prompts_zeroshot.py`. You may design class-aware prompts for your new task by following the templates provided in that file.
-
-### 3.2. Per-task Finetuning
-
-Run the below python script to perform per-task finetuning:
-
-```
-python train_random_sampling.py --save_dir /path/to/finetuned/checkpoints
+```bash
+bash scripts/mergemodel.sh
 ```
 
-where `/path/to/finetuned/checkpoints` is the directory where you want the model checkpoints to be stored.
+### 4.2. TTA evaluation
 
-### 3.3. Model Merging
+Class-IL TTA:
 
-Run the following Python script to perform model merging:
-
-```
-python opcm_mergeslide.py --num_tasks 6 
---src_finedtuned_checkpoints /path/to/finetuned/checkpoints 
---des_merged_checkpoints /path/to/merged/checkpoints/
+```bash
+bash scripts/test_classIL_tta.sh
 ```
 
-Merged checkpoints are stored in `/path/to/merged/checkpoints/` (All tasks only use one checkpoint for later inference).
+Task-IL TTA:
 
-Note: Because we perform 10-fold cross-validation, the script generates 10 folders named `/path/to/merged/checkpoints/_fold_*`. Each folder contains `num_tasks=6` merged checkpoints (6 tasks in this study), representing the accumulated model state after each task. These intermediate checkpoints are used only for evaluating continual learning metrics such as forgetting, BWT, and FWT.
-
-```
-[/path/to/merged/checkpoints/]_fold_0
-|___merged_weight_opcm_random_sampling_fold_0_task_0.pth
-|___merged_weight_opcm_random_sampling_fold_0_task_1.pth
-|___merged_weight_opcm_random_sampling_fold_0_task_2.pth
-|___...
-|___merged_weight_opcm_random_sampling_fold_0_task_6.pth
+```bash
+bash scripts/test_taskIL_tta.sh
 ```
 
-If you do not need to compute forgetting, BWT, or FWT, only the final checkpoint`merged_weight_opcm_random_sampling_fold_0_task_6.pth`
-is required for inference on all `num_tasks=6` tasks in this study.
+These scripts run the current TTA setup used in this repo, including LN adaptation and the routing-aware variants introduced for MergeSlide-TTA.
 
-### 3.3. Evaluation
+### 4.3. Baseline evaluation entrypoints
 
-The evaluation is designed for CLASS-IL and TASK-IL scenario.
+Class-IL baseline on the original MergeSlide setting:
 
-For CLASS-IL, if we only need Accuracy, Balanced Accuracy, Macro/Weighted F1, Precicion, Recall for all tasks after training the last task, just run:
-
-```
-python test_classIL_task_prompt.py --save_dir /path/to/finetuned_checkpoints 
---merge_model_path /path/to/merged/checkpoints/
+```bash
+bash scripts/test_classIL.sh
 ```
 
-If we need Forgetting, BWT, FWT:
+Task-IL baseline on the original MergeSlide setting:
 
-```
-python test_classIL_task_prompt_other_metrics.py --save_dir /path/to/finetuned_checkpoints 
---merge_model_path /path/to/merged/checkpoints/
-```
-
-For TASK-IL scenario, just run:
-
-```
-python test_taskIL.py --save_dir /path/to/finetuned_checkpoints 
---merge_model_path /path/to/merged/checkpoints/
+```bash
+bash scripts/test_taskIL.sh
 ```
 
-**Note 1:** we load `/path/to/finetuned_checkpoints` only to extract the class-aware prompts from the per-task finetuned checkpoints (these checkpoints remain completely frozen during training; that is, the class-aware prompt embeddings do not change from TITAN to the per-task finetuning stage). We do this purely for convenience. A more efficient implementation could be added later, where only the class-aware prompts are provided directly, eliminating the need to load the per-task finetuned checkpoints and avoiding potential confusion.
+## 5. MergeSlide-TTA summary
 
-**Note 2:** For the main results, we report balanced accuracy. However, for metrics such as FGT, BWT, and Forgetting, we use standard accuracy for their calculation.
+The proposed adaptation strategy is:
 
-To reproduce Table 2 in the MergeSlide manuscript, please use the checkpoints provided [here](https://drive.google.com/drive/folders/1Bf0-A0M8Si56GQjJR9HeJhef2YVkm3KK?usp=sharing). For other tables, please contact me at caodoanh2001 at gmail dot com.
+- freeze merging coefficients
+- freeze class-aware and task-level prompt embeddings
+- freeze the TITAN backbone
+- update only selected LayerNorm affine parameters during test time
+- use entropy-guided confidence filtering to decide whether to adapt a slide
+- keep the adaptation small enough to avoid breaking the merged model structure
 
-## 4. Acknowledgement
+This is intended for OOD / cross-site WSI inference, where the original MergeSlide model can lose accuracy under domain shift.
 
-To complete this study, we were inspired by the following code bases:
+## 6. Acknowledgement
 
-- [TITAN](https://github.com/mahmoodlab/TITAN)
-- [FusionBench](https://github.com/tanganke/fusion_bench)
-- [CATE](https://github.com/HKU-MedAI/CATE)
+This project builds on the original MergeSlide code base:
 
-Once again, we sincerely thank the authors of these projects for their tremendous effort and contributions, which allowed us to stand on the shoulders of giants.
+- https://github.com/caodoanh2001/MergeSlide
 
-## 5. Citation
-If you find this work useful in your research, please consider citing:
-```
+It is also inspired by:
 
-@inproceedings{
-    bui2026merge,
-    title={MergeSlide: Continual Model Merging and Task-to-Class Prompt-Aligned Inference for Lifelong Learning on Whole Slide Images},
-    author={Doanh C. Bui, Ba Hung Ngo, Hoai Luan Pham, Khang Nguyen, Maï K. Nguyen, Yasuhiko Nakashima},
-    booktitle={The IEEE/CVF Winter Conference on Applications of Computer Vision},
-    year={2026},
-}
-```
+- TITAN
+- FusionBench
+- CATE
+
+The authors thank the original projects for their work and for making the research path possible.
