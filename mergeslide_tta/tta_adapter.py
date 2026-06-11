@@ -1,396 +1,264 @@
+# test_taskIL_tta.py
 """
-tta_adapter.py - MergeSlide-TTA core module.
+Task-IL TTA evaluation (upper bound with adaptation).
 
-Pipeline per slide:
-  1. Quick no-grad forward -> compute entropy (WSI-level filter)
-  2. If entropy < threshold (IND slide) -> skip TTA, return directly
-  3. If entropy >= threshold (OOD slide) -> create M sub-bags -> forward
-     -> compute dual-level loss -> update LN params -> re-infer
+Task identity is known at inference time, so:
+  - No task routing (task_prompts not used in loss)
+  - Loss = class-level entropy + diversity over C_task classes only
+  - This is the cleanest TTA setup: pure Information Maximization on correct task
 
-Batch size = M = 8 sub-bags per slide, each sub-bag has K_sub = 300 patches.
-
-Modes:
-  tcp   -- TCP routing: t_hat from task_prompts -> class logits from task MLP
-  naive -- use all_class_embeddings [768, C_total] directly
-
-Frozen : all params except LayerNorm weight/bias in backbone
-Updated: LN weight + bias only
+Usage:
+    python test_taskIL_tta.py \\
+        --save_dir ./checkpoints/finetuned \\
+        --merge_model_path ./checkpoints/merged
 """
+import argparse
+import os
+import time
+from pathlib import Path
 
-from copy import deepcopy
-from typing import Dict, List, Optional, Tuple
-
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from omegaconf import OmegaConf
+from sklearn.metrics import balanced_accuracy_score
+from tqdm import tqdm
+from transformers import AutoModel
 
-from mergeslide_tta.constants import TITAN_PS_ARG
-from mergeslide_tta.tta_losses import (
-    dual_level_tta_loss,
-    l2_anchor_loss,
-    select_confident_subbags,
-)
+from mergeslide_tta.constants import EMBED_DIM, K_PATCHES, NUM_TASKS, TITAN_PS_ARG
+from mergeslide_tta.datasets import Sequential_Generic_MIL_Dataset
+from mergeslide_tta.metrics import pad_numpy_arrays
+from mergeslide_tta.utils import get_eval_metrics, seed_torch
+from mergeslide_tta.tta_adapter import MergeSlide_TTA, load_task_weights
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def collect_ln_params(model: nn.Module) -> Tuple[List[torch.Tensor], List[str]]:
-    """Collect weight + bias of all nn.LayerNorm in model."""
-    params, names = [], []
-    for name, module in model.named_modules():
-        if isinstance(module, nn.LayerNorm):
-            if module.weight is not None:
-                params.append(module.weight)
-                names.append(f"{name}.weight")
-            if module.bias is not None:
-                params.append(module.bias)
-                names.append(f"{name}.bias")
-    return params, names
+PROJECT_ROOT = Path(__file__).resolve().parent
+HOT_DIR_NAMES = {"checkpoints", "logs", "sqlite"}
 
 
-def configure_backbone_for_tta(backbone: nn.Module) -> nn.Module:
-    """Freeze all backbone params, enable grad only for LN affine params."""
-    backbone.train()
-    backbone.requires_grad_(False)
-    for module in backbone.modules():
-        if isinstance(module, nn.LayerNorm):
-            module.requires_grad_(True)
-    return backbone
+def get_local_hot_root() -> Path:
+    user = os.environ.get("USER") or "thanhld"
+    default_root = Path("/docker/data") / user / PROJECT_ROOT.name
+    return Path(os.environ.get("MERGESLIDE_LOCAL_ROOT", default_root)).expanduser()
 
 
-# ---------------------------------------------------------------------------
-# MergeSlide-TTA
-# ---------------------------------------------------------------------------
+def ensure_local_hot_storage() -> Path:
+    local_root = get_local_hot_root()
+    local_root.mkdir(parents=True, exist_ok=True)
+    for name in HOT_DIR_NAMES:
+        (local_root / name).mkdir(parents=True, exist_ok=True)
+    (local_root / "tmp").mkdir(parents=True, exist_ok=True)
+    for name in ("logs", "checkpoints"):
+        repo_path  = PROJECT_ROOT / name
+        local_path = local_root / name
+        if not repo_path.exists() and not repo_path.is_symlink():
+            repo_path.symlink_to(local_path, target_is_directory=True)
+    os.environ.setdefault("TMPDIR",                str(local_root / "tmp"))
+    os.environ.setdefault("SQLITE_TMPDIR",         str(local_root / "sqlite"))
+    os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+    return local_root
 
-class MergeSlide_TTA(nn.Module):
+
+def resolve_hot_path(path: str, local_root: Path) -> Path:
+    raw = Path(path).expanduser()
+    if not raw.is_absolute():
+        parts = raw.parts
+        if parts and parts[0] in HOT_DIR_NAMES:
+            return local_root.joinpath(*parts)
+        return raw
+    try:
+        relative = raw.relative_to(PROJECT_ROOT)
+    except ValueError:
+        return raw
+    parts = relative.parts
+    if parts and parts[0] in HOT_DIR_NAMES:
+        return local_root.joinpath(*parts)
+    return raw
+
+
+def eval_task_taskil_tta(
+    test_loader,
+    task_id:     int,
+    tta_model:   MergeSlide_TTA,
+    device,
+    verbose_loss: bool = False,
+) -> tuple:
     """
-    Test-Time Adaptation wrapper for MergeSlide.
-
-    Args:
-        backbone             : model.backbone (TITAN vision_encoder after merging)
-        task_prompts         : [T, 768] task-level prompt embeddings (frozen)
-        task_weights         : list of dict{'weight', 'bias'} MLP weights per task
-        num_classes          : list of int, classes per task
-        device               : torch.device
-        mode                 : 'tcp' or 'naive' -- mirrors --mode in original eval
-        all_class_embeddings : [768, C_total] required when mode='naive'
-        M                    : sub-bags per slide = TTA batch size (default 8)
-        K_sub                : patches per sub-bag (default 300)
-        top_ratio            : confident sub-bag keep ratio (default 0.5)
-        alpha                : task-level loss weight (default 0.5)
-        beta                 : L2 anchor regularizer weight (default 1.0)
-        lr                   : Adam learning rate (default 1e-4)
-        n_steps              : adapt steps per slide (default 1)
-        episodic             : reset LN params after each slide (default False = continual)
-        entropy_threshold    : only TTA when entropy >= threshold (default 0.4)
+    Task-IL TTA inference for 1 task.
+    task_id is known -> tta_model uses mode='task_il' with fixed_task_id=task_id.
+    pred_class is LOCAL (0..C_task-1), targets are LOCAL.
     """
+    preds_all   = []
+    probs_all   = []
+    targets_all = []
+    loss_logs   = []
 
-    def __init__(
-        self,
-        backbone:             nn.Module,
-        task_prompts:         torch.Tensor,
-        task_weights:         List[Dict],
-        num_classes:          List[int],
-        device:               torch.device,
-        mode:                 str                     = "tcp",
-        all_class_embeddings: Optional[torch.Tensor] = None,
-        fixed_task_id:        Optional[int]           = None,
-        M:                    int   = 8,
-        K_sub:                int   = 300,
-        top_ratio:            float = 0.5,
-        alpha:                float = 0.5,
-        beta:                 float = 1.0,
-        lr:                   float = 1e-4,
-        n_steps:              int   = 1,
-        episodic:             bool  = False,
-        entropy_threshold:    float = 0.4,
-    ):
-        super().__init__()
+    for features, coords, label in tqdm(test_loader, leave=False):
+        features = features.to(device)
+        coords   = coords.long().to(device)
 
-        assert mode in ("tcp", "naive", "task_il"), \
-            f"mode must be 'tcp', 'naive', or 'task_il', got: {mode}"
-        if mode == "naive":
-            assert all_class_embeddings is not None, \
-                "all_class_embeddings required when mode='naive'"
-        if mode == "task_il":
-            assert fixed_task_id is not None, \
-                "fixed_task_id required when mode='task_il'"
+        idx = torch.randperm(features.shape[0])[:K_PATCHES]
+        features, coords = features[idx], coords[idx]
 
-        self.backbone             = configure_backbone_for_tta(backbone)
-        self.device               = device
-        self.mode                 = mode
-        self.task_prompts         = task_prompts.to(device)
-        self.task_weights         = task_weights
-        self.num_classes          = num_classes
-        self.all_class_embeddings = (
-            all_class_embeddings.detach().clone().to(device)
-            if all_class_embeddings is not None else None
-        )
-        self.fixed_task_id        = fixed_task_id
-        self.M                    = M
-        self.K_sub                = K_sub
-        self.top_ratio            = top_ratio
-        self.alpha                = alpha
-        self.beta                 = beta
-        self.n_steps              = n_steps
-        self.episodic             = episodic
-        self.entropy_threshold    = entropy_threshold
-        self.ps                   = torch.tensor(TITAN_PS_ARG).int().to(device)
-
-        self.n_adapted = 0
-        self.n_skipped = 0
-
-        ln_params, self.ln_names = collect_ln_params(self.backbone)
-        self.ln_params_anchor: List[torch.Tensor] = [
-            p.detach().clone() for p in ln_params
-        ]
-
-        self.optimizer = torch.optim.Adam(ln_params, lr=lr)
-
-        self._init_backbone = deepcopy(self.backbone.state_dict())
-        self._init_optim    = deepcopy(self.optimizer.state_dict())
-
-        mode_info = (f"mode={mode}" if mode != "task_il"
-                     else f"mode=task_il(task={fixed_task_id})")
-        num_ln      = len([m for m in self.backbone.modules()
-                           if isinstance(m, nn.LayerNorm)])
-        n_ln_params = sum(p.numel() for p in ln_params)
-        print(
-            f"[MergeSlide-TTA] {mode_info} | LN layers={num_ln} | "
-            f"LN params={n_ln_params:,} | M={M} sub-bags | K_sub={K_sub} | "
-            f"top_ratio={top_ratio} | alpha={alpha} | beta={beta} | "
-            f"lr={lr} | n_steps={n_steps} | episodic={episodic} | "
-            f"entropy_threshold={entropy_threshold}"
-        )
-
-    # -----------------------------------------------------------------------
-    # Sub-bag creation
-    # -----------------------------------------------------------------------
-
-    def _make_subbags(
-        self, features: torch.Tensor, coords: torch.Tensor,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        K    = features.shape[0]
-        k_sub = min(self.K_sub, K)
-        feat_list, coord_list = [], []
-        for _ in range(self.M):
-            idx = torch.randperm(K, device=features.device)[:k_sub]
-            feat_list.append(features[idx])
-            coord_list.append(coords[idx])
-        return feat_list, coord_list
-
-    # -----------------------------------------------------------------------
-    # Forward sub-bags
-    # -----------------------------------------------------------------------
-
-    def _forward_subbags(
-        self,
-        feat_list:  List[torch.Tensor],
-        coord_list: List[torch.Tensor],
-    ) -> torch.Tensor:
-        """Returns [M, 768] keeping computation graph alive (grad through LN)."""
-        embeds = [self.backbone(f, c, self.ps)
-                  for f, c in zip(feat_list, coord_list)]
-        return torch.cat(embeds, dim=0)
-
-    # -----------------------------------------------------------------------
-    # Class logits by mode
-    # -----------------------------------------------------------------------
-
-    def _class_logits_tcp(
-        self, embeds: torch.Tensor, task_id: int
-    ) -> torch.Tensor:
-        """[N, C_task] using frozen MLP weights of task_id."""
-        w = self.task_weights[task_id]["weight"].detach()
-        b = self.task_weights[task_id]["bias"].detach()
-        return F.linear(embeds.float(), w, b)
-
-    def _class_logits_naive(self, embeds: torch.Tensor) -> torch.Tensor:
-        """[N, C_total] using all_class_embeddings."""
-        return embeds.float() @ self.all_class_embeddings.detach()
-
-    # -----------------------------------------------------------------------
-    # 1 adaptation step
-    # -----------------------------------------------------------------------
-
-    @torch.enable_grad()
-    def _adapt_step(
-        self, features: torch.Tensor, coords: torch.Tensor,
-    ) -> dict:
-        feat_list, coord_list = self._make_subbags(features, coords)
-        embeds      = self._forward_subbags(feat_list, coord_list)   # [M, 768]
-        task_logits = embeds.float() @ self.task_prompts.T.detach()  # [M, T]
-
-        if self.mode == "tcp":
-            with torch.no_grad():
-                mean_z = embeds.detach().float().mean(dim=0, keepdim=True)
-                t_hat  = int(
-                    (mean_z @ self.task_prompts.T.detach()).argmax(dim=1)
-                )
-            class_logits = self._class_logits_tcp(embeds, t_hat)
-        elif self.mode == "task_il":
-            # Task identity known: use fixed task, no routing
-            t_hat        = self.fixed_task_id
-            class_logits = self._class_logits_tcp(embeds, t_hat)
-        else:
-            t_hat        = -1
-            class_logits = self._class_logits_naive(embeds)
-
-        _, idx_class = select_confident_subbags(class_logits.detach(), self.top_ratio)
-        _, idx_task  = select_confident_subbags(task_logits.detach(),  self.top_ratio)
-        sel_idx      = torch.unique(torch.cat([idx_class, idx_task]))
-
-        # Loss mode:
-        #   tcp     : class entropy + diversity + alpha * task terms
-        #   naive   : class entropy only (alpha=0, no diversity over 13 classes)
-        #   task_il : class entropy + diversity only (alpha=0, task routing irrelevant)
-        if self.mode == "naive":
-            effective_alpha = 0.0
-            use_diversity   = False
-        elif self.mode == "task_il":
-            effective_alpha = 0.0    # no task loss, task is already known
-            use_diversity   = True   # diversity over C_task=2~3 classes is meaningful
-        else:
-            effective_alpha = self.alpha
-            use_diversity   = True
-
-        loss, log = dual_level_tta_loss(
-            class_logits[sel_idx], task_logits[sel_idx],
-            effective_alpha, use_diversity=use_diversity
-        )
-
-        if self.beta > 0:
-            ln_params = [p for p in self.backbone.parameters() if p.requires_grad]
-            reg       = l2_anchor_loss(ln_params, self.ln_params_anchor)
-            loss      = loss + self.beta * reg
-            log["loss/l2_reg"] = reg.item()
-
-        log["loss/total_with_reg"] = loss.item()
-        log["adapt/t_hat"]         = t_hat
-        log["adapt/n_selected"]    = sel_idx.numel()
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        return log
-
-    # -----------------------------------------------------------------------
-    # Quick inference (no grad)
-    # -----------------------------------------------------------------------
-
-    def _quick_inference(
-        self, features: torch.Tensor, coords: torch.Tensor,
-    ) -> Tuple[int, torch.Tensor, int, float]:
-        """
-        No-grad forward with full K patches.
-        Returns (pred_class, probs[1,C], pred_task, entropy_value).
-        """
-        self.backbone.eval()
-        with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            z           = self.backbone(features, coords, self.ps)
-            task_logits = z.float() @ self.task_prompts.T
-            pred_task   = int(task_logits.argmax(dim=1))
-
-            if self.mode == "tcp":
-                class_logits = self._class_logits_tcp(z.float(), pred_task)
-            elif self.mode == "task_il":
-                # Use fixed task -- override pred_task with known identity
-                pred_task    = self.fixed_task_id
-                class_logits = self._class_logits_tcp(z.float(), pred_task)
-            else:
-                class_logits = self._class_logits_naive(z.float())
-
-            probs      = F.softmax(class_logits.float(), dim=1)
-            pred_class = int(class_logits.argmax(dim=1))
-            entropy    = -(probs * probs.clamp(min=1e-8).log()).sum().item()
-
-        return pred_class, probs.cpu(), pred_task, entropy
-
-    # -----------------------------------------------------------------------
-    # Public: adapt + predict
-    # -----------------------------------------------------------------------
-
-    def adapt_and_predict(
-        self, features: torch.Tensor, coords: torch.Tensor,
-    ) -> Tuple[int, torch.Tensor, int, dict]:
-        """
-        WSI-level filter + TTA + inference for 1 slide.
-
-        Flow:
-          1. Quick forward -> entropy
-          2. entropy < threshold (IND) -> skip TTA, return directly
-          3. entropy >= threshold (OOD) -> TTA -> re-infer
-
-        Returns:
-            pred_class : int
-            probs      : [1, C] softmax probs (CPU)
-            pred_task  : int
-            adapt_log  : dict
-        """
-        pred_class, probs, pred_task, entropy = self._quick_inference(
+        pred_class, probs, _, adapt_log = tta_model.adapt_and_predict(
             features, coords
         )
-        adapt_log = {"slide/entropy": entropy, "slide/adapted": False}
+        if verbose_loss:
+            loss_logs.append(adapt_log)
 
-        if entropy < self.entropy_threshold:
-            self.n_skipped += 1
-            self.backbone.train()
-            return pred_class, probs, pred_task, adapt_log
+        preds_all.append(np.array([pred_class]))
+        probs_all.append(probs.numpy())
+        targets_all.append(label.numpy())
 
-        self.n_adapted += 1
+    preds_arr   = np.concatenate(preds_all)
+    targets_arr = np.concatenate(targets_all)
+    try:
+        probs_arr = np.concatenate(probs_all)
+    except ValueError:
+        probs_arr = pad_numpy_arrays(probs_all)
 
-        if self.episodic:
-            self._reset()
+    metrics = get_eval_metrics(
+        targets_arr, preds_arr, probs_arr,
+        roc_kwargs={"multi_class": "ovo", "average": "macro"},
+        prefix="",
+    )
 
-        self.backbone.train()
+    if verbose_loss and loss_logs:
+        adapted = [d for d in loss_logs if d.get("slide/adapted")]
+        if adapted:
+            mean_loss = np.mean([d.get("loss/total_with_reg", 0) for d in adapted])
+            print(f"    [TTA] task={task_id} adapted={len(adapted)}/{len(loss_logs)} "
+                  f"mean_loss={mean_loss:.4f}")
 
-        for _ in range(self.n_steps):
-            adapt_log = self._adapt_step(features, coords)
-
-        pred_class, probs, pred_task, _ = self._quick_inference(features, coords)
-        adapt_log["slide/entropy"] = entropy
-        adapt_log["slide/adapted"] = True
-
-        self.backbone.train()
-        return pred_class, probs, pred_task, adapt_log
-
-    # -----------------------------------------------------------------------
-    # Reset
-    # -----------------------------------------------------------------------
-
-    def _reset(self):
-        self.backbone.load_state_dict(self._init_backbone, strict=True)
-        self.optimizer.load_state_dict(self._init_optim)
-
-    def hard_reset(self):
-        """Call after each fold to restore params and reset counters."""
-        self._reset()
-        self.n_adapted = 0
-        self.n_skipped = 0
+    return metrics, preds_arr, targets_arr
 
 
-# ---------------------------------------------------------------------------
-# Helper: load task MLP weights
-# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    torch.multiprocessing.set_sharing_strategy("file_system")
 
-def load_task_weights(
-    task_model_paths: List[str],
-    device:           torch.device,
-) -> List[Dict]:
-    """
-    Load MLP weight + bias for each task from task_{t}.pt checkpoint.
-    Takes the last 'weight' and 'bias' keys (MLP linear head).
-    """
-    task_weights = []
-    for path in task_model_paths:
-        state = torch.load(path, map_location=device)
-        keys  = list(state.keys())
-        w_key = next(k for k in reversed(keys) if "weight" in k)
-        b_key = next(k for k in reversed(keys) if "bias"   in k)
-        task_weights.append({
-            "weight": state[w_key].to(device),
-            "bias":   state[b_key].to(device),
-        })
-    return task_weights
+    parser = argparse.ArgumentParser(description="Task-IL TTA evaluation (upper bound)")
+    parser.add_argument("--config",           type=str, default="configs/default.yaml")
+    parser.add_argument("--save_dir",         type=str, required=True)
+    parser.add_argument("--merge_model_path", type=str, required=True)
+    # TTA hyperparams
+    parser.add_argument("--M",                 type=int,   default=8)
+    parser.add_argument("--K_sub",             type=int,   default=300)
+    parser.add_argument("--top_ratio",         type=float, default=0.5)
+    parser.add_argument("--beta",              type=float, default=1.0)
+    parser.add_argument("--lr",                type=float, default=1e-4)
+    parser.add_argument("--n_steps",           type=int,   default=1)
+    parser.add_argument("--entropy_threshold", type=float, default=0.4)
+    parser.add_argument("--episodic",          action="store_true")
+    parser.add_argument("--verbose_loss",      action="store_true")
+    # Note: --alpha not exposed for task_il (always 0.0 internally)
+    args = parser.parse_args()
+
+    local_hot_root        = ensure_local_hot_storage()
+    args.save_dir         = str(resolve_hot_path(args.save_dir,         local_hot_root))
+    args.merge_model_path = str(resolve_hot_path(args.merge_model_path, local_hot_root))
+
+    cfg    = OmegaConf.load(args.config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed_torch(device, cfg.training.seed)
+
+    num_tasks   = cfg.training.num_tasks
+    seq_dataset = Sequential_Generic_MIL_Dataset(cfg)
+
+    # task_prompts still needed for _quick_inference backbone forward
+    # (task_il mode overrides pred_task but backbone still needs ps)
+    task_prompts = torch.load(PROJECT_ROOT / "task_prompts.pt").to(device)
+    if getattr(cfg.dataset, "order", "forward") == "reverse":
+        task_prompts = task_prompts.flip(0)
+
+    print("Loading TITAN base model ...")
+    base_model = AutoModel.from_pretrained("MahmoodLab/TITAN", trust_remote_code=True)
+    base_model = base_model.to(device)
+
+    overall_baccs    = []
+    overall_accs     = []
+    all_acc_per_task = []
+
+    for fold_id in tqdm(range(cfg.training.num_folds), desc="Folds"):
+        fold = f"fold_{fold_id}"
+
+        merge_path = Path(args.merge_model_path) / fold / "merged_final.pth"
+        print(f"\nLoading: {merge_path}")
+        base_model.vision_encoder.load_state_dict(
+            torch.load(str(merge_path), map_location="cpu")
+        )
+
+        task_model_paths = [
+            str(Path(args.save_dir) / fold / f"task_{t}.pt")
+            for t in range(num_tasks)
+        ]
+        task_weights = load_task_weights(task_model_paths, device)
+
+        all_baccs    = []
+        all_accs     = []
+        acc_per_task = {}
+
+        for task_id in range(num_tasks):
+            # Build TTA model with fixed_task_id for this task
+            tta_model = MergeSlide_TTA(
+                backbone          = base_model.vision_encoder,
+                task_prompts      = task_prompts,
+                task_weights      = task_weights,
+                num_classes       = seq_dataset.num_classes,
+                device            = device,
+                mode              = "task_il",
+                fixed_task_id     = task_id,
+                M                 = args.M,
+                K_sub             = args.K_sub,
+                top_ratio         = args.top_ratio,
+                alpha             = 0.0,   # always 0 for task_il
+                beta              = args.beta,
+                lr                = args.lr,
+                n_steps           = args.n_steps,
+                episodic          = args.episodic,
+                entropy_threshold = args.entropy_threshold,
+            )
+
+            _, _, test_loader = seq_dataset.get_data_loaders(fold_id, task_id)
+
+            results, preds_all, targets_all = eval_task_taskil_tta(
+                test_loader  = test_loader,
+                task_id      = task_id,
+                tta_model    = tta_model,
+                device       = device,
+                verbose_loss = args.verbose_loss,
+            )
+
+            bacc = balanced_accuracy_score(targets_all, preds_all)
+            acc  = sum(preds_all == targets_all) / len(test_loader)
+            acc_per_task[task_id] = acc
+            all_baccs.append(bacc)
+            all_accs.append(acc)
+
+            n_adapted = tta_model.n_adapted
+            n_total   = n_adapted + tta_model.n_skipped
+            print(f"  Fold {fold_id} | {seq_dataset.task_names[task_id]}: "
+                  f"BAcc={bacc*100:.4f}% Acc={acc*100:.4f}% "
+                  f"adapted={n_adapted}/{n_total}")
+
+            tta_model.hard_reset()
+
+        overall_baccs.append(np.mean(all_baccs))
+        overall_accs.append(np.mean(all_accs))
+        all_acc_per_task.append(acc_per_task)
+
+        print(f"[Fold {fold_id}] BAcc={np.mean(all_baccs)*100:.4f}% "
+              f"Acc={np.mean(all_accs)*100:.4f}%")
+
+    print("\n===== Task-IL TTA Results =====")
+    print(f"Balanced Acc: {np.mean(overall_baccs)*100:.4f}%"
+          f" ({np.std(overall_baccs)*100:.4f}%)")
+    print(f"Accuracy:     {np.mean(overall_accs)*100:.4f}%"
+          f" ({np.std(overall_accs)*100:.4f}%)")
+
+    print("\nAcc per task:")
+    accs = {t: [] for t in range(num_tasks)}
+    for fold_acc in all_acc_per_task:
+        for t in range(num_tasks):
+            accs[t].append(fold_acc[t])
+    for t in range(num_tasks):
+        print(f"  {seq_dataset.task_names[t]}: {np.mean(accs[t])*100:.4f}%"
+              f" ({np.std(accs[t])*100:.4f}%)")

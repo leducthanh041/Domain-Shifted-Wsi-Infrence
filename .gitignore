@@ -18,6 +18,8 @@ ENV/
 .codex/
 .agents/
 AGENTS.md
+SKILLS.md
+docs/CODEX_*.md
 
 # ---------------------------------------------------------------------------
 # Editor, OS, and notebook noise
