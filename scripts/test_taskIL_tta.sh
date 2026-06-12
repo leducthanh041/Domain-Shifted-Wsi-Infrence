@@ -32,6 +32,7 @@ TTA_TOP_RATIO="${TTA_TOP_RATIO:-0.5}"
 TTA_BETA="${TTA_BETA:-1.0}"
 TTA_LR="${TTA_LR:-1e-4}"
 TTA_N_STEPS="${TTA_N_STEPS:-1}"
+TTA_PARAM_SCOPE="${TTA_PARAM_SCOPE:-ln_only}"
 TTA_ENTROPY_THRESHOLD="${TTA_ENTROPY_THRESHOLD:-0.4}"
 TTA_EPISODIC="${TTA_EPISODIC:-0}"
 
@@ -86,7 +87,7 @@ echo "[INFO] log_dir=$LOG_DIR"
 echo "[INFO] taskil_tta_entrypoint=$TASKIL_TTA_ENTRYPOINT"
 echo "[INFO] === TTA v1 params ==="
 echo "[INFO] M=$TTA_M | K_sub=$TTA_K_SUB | top_ratio=$TTA_TOP_RATIO"
-echo "[INFO] beta=$TTA_BETA | lr=$TTA_LR | n_steps=$TTA_N_STEPS"
+echo "[INFO] beta=$TTA_BETA | lr=$TTA_LR | n_steps=$TTA_N_STEPS | param_scope=$TTA_PARAM_SCOPE"
 echo "[INFO] entropy_threshold=$TTA_ENTROPY_THRESHOLD | reset=$EPISODIC_LABEL"
 
 check_log_not_held() {
@@ -135,6 +136,7 @@ TTA_ARGS=(
     --beta              "$TTA_BETA"
     --lr                "$TTA_LR"
     --n_steps           "$TTA_N_STEPS"
+    --tta_param_scope   "$TTA_PARAM_SCOPE"
     --entropy_threshold "$TTA_ENTROPY_THRESHOLD"
     --verbose_loss
 )

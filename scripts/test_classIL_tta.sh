@@ -39,6 +39,7 @@ TTA_ALPHA="${TTA_ALPHA:-0.5}"               # task loss weight
 TTA_BETA="${TTA_BETA:-1.0}"                 # L2 anchor weight
 TTA_LR="${TTA_LR:-1e-4}"                    # LN optimizer lr
 TTA_N_STEPS="${TTA_N_STEPS:-1}"             # adapt steps/slide
+TTA_PARAM_SCOPE="${TTA_PARAM_SCOPE:-ln_only}"  # ln_only | full
 TTA_ENTROPY_THRESHOLD="${TTA_ENTROPY_THRESHOLD:-0.4}"  # WSI-level filter
 
 TTA_EPISODIC="${TTA_EPISODIC:-1}"
@@ -103,7 +104,7 @@ echo "[INFO] tta_entrypoint=$TTA_ENTRYPOINT"
 echo "[INFO] log_dir=$LOG_DIR"
 echo "[INFO] cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
 echo "[INFO] tta_variants=$TTA_VARIANTS"
-echo "[INFO] TTA M=$TTA_M | K_sub=$TTA_K_SUB | top_ratio=$TTA_TOP_RATIO | alpha=$TTA_ALPHA | beta=$TTA_BETA | lr=$TTA_LR | n_steps=$TTA_N_STEPS | entropy_threshold=$TTA_ENTROPY_THRESHOLD | reset=$EPISODIC_LABEL | verbose_loss=$TTA_VERBOSE_LOSS"
+echo "[INFO] TTA M=$TTA_M | K_sub=$TTA_K_SUB | top_ratio=$TTA_TOP_RATIO | alpha=$TTA_ALPHA | beta=$TTA_BETA | lr=$TTA_LR | n_steps=$TTA_N_STEPS | param_scope=$TTA_PARAM_SCOPE | entropy_threshold=$TTA_ENTROPY_THRESHOLD | reset=$EPISODIC_LABEL | verbose_loss=$TTA_VERBOSE_LOSS"
 
 entrypoint_path="$TTA_ENTRYPOINT"
 if [[ "$entrypoint_path" != /* ]]; then
@@ -179,6 +180,7 @@ TTA_ARGS=(
     --beta              "$TTA_BETA"
     --lr                "$TTA_LR"
     --n_steps           "$TTA_N_STEPS"
+    --tta_param_scope   "$TTA_PARAM_SCOPE"
     --entropy_threshold "$TTA_ENTROPY_THRESHOLD"
 )
 if [ -n "$EPISODIC_FLAG" ]; then

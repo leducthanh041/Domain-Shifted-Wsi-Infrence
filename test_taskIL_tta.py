@@ -146,6 +146,9 @@ if __name__ == "__main__":
     parser.add_argument("--beta",              type=float, default=1.0)
     parser.add_argument("--lr",                type=float, default=1e-4)
     parser.add_argument("--n_steps",           type=int,   default=1)
+    parser.add_argument("--tta_param_scope",   type=str,   default="ln_only",
+                        choices=["ln_only", "full"],
+                        help="Backbone parameter scope for TTA.")
     parser.add_argument("--entropy_threshold", type=float, default=0.4)
     parser.add_argument("--episodic",          action="store_true")
     parser.add_argument("--verbose_loss",      action="store_true")
@@ -206,6 +209,7 @@ if __name__ == "__main__":
                 device            = device,
                 mode              = "task_il",
                 fixed_task_id     = task_id,
+                param_scope       = args.tta_param_scope,
                 M                 = args.M,
                 K_sub             = args.K_sub,
                 top_ratio         = args.top_ratio,
@@ -248,7 +252,7 @@ if __name__ == "__main__":
         print(f"[Fold {fold_id}] BAcc={np.mean(all_baccs)*100:.4f}% "
               f"Acc={np.mean(all_accs)*100:.4f}%")
 
-    print("\n===== Task-IL TTA Results =====")
+    print(f"\n===== Task-IL TTA Results ({args.tta_param_scope}) =====")
     print(f"Balanced Acc: {np.mean(overall_baccs)*100:.4f}%"
           f" ({np.std(overall_baccs)*100:.4f}%)")
     print(f"Accuracy:     {np.mean(overall_accs)*100:.4f}%"

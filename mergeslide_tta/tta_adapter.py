@@ -5,7 +5,7 @@ Pipeline per slide:
   1. Quick no-grad forward -> compute entropy (WSI-level filter)
   2. If entropy < threshold (IND slide) -> skip TTA, return directly
   3. If entropy >= threshold (OOD slide) -> create M sub-bags -> forward
-     -> compute dual-level loss -> update LN params -> re-infer
+     -> compute dual-level loss -> update selected backbone params -> re-infer
 
 Batch size = M = 8 sub-bags per slide, each sub-bag has K_sub = 300 patches.
 
@@ -13,8 +13,9 @@ Modes:
   tcp   -- TCP routing: t_hat from task_prompts -> class logits from task MLP
   naive -- use all_class_embeddings [768, C_total] directly
 
-Frozen : all params except LayerNorm weight/bias in backbone
-Updated: LN weight + bias only
+Param scopes:
+  ln_only -- update only LayerNorm weight/bias in the backbone
+  full    -- update all backbone parameters
 """
 
 from copy import deepcopy
@@ -50,13 +51,38 @@ def collect_ln_params(model: nn.Module) -> Tuple[List[torch.Tensor], List[str]]:
     return params, names
 
 
-def configure_backbone_for_tta(backbone: nn.Module) -> nn.Module:
-    """Freeze all backbone params, enable grad only for LN affine params."""
+def collect_adaptation_params(
+    model: nn.Module,
+    param_scope: str = "ln_only",
+) -> Tuple[List[torch.Tensor], List[str]]:
+    """Collect trainable parameters according to the chosen adaptation scope."""
+    if param_scope == "ln_only":
+        return collect_ln_params(model)
+    if param_scope == "full":
+        params, names = [], []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                params.append(param)
+                names.append(name)
+        return params, names
+    raise ValueError(f"Unsupported param_scope: {param_scope}")
+
+
+def configure_backbone_for_tta(
+    backbone: nn.Module,
+    param_scope: str = "ln_only",
+) -> nn.Module:
+    """Configure which backbone params are trainable during TTA."""
     backbone.train()
     backbone.requires_grad_(False)
-    for module in backbone.modules():
-        if isinstance(module, nn.LayerNorm):
-            module.requires_grad_(True)
+    if param_scope == "ln_only":
+        for module in backbone.modules():
+            if isinstance(module, nn.LayerNorm):
+                module.requires_grad_(True)
+    elif param_scope == "full":
+        backbone.requires_grad_(True)
+    else:
+        raise ValueError(f"Unsupported param_scope: {param_scope}")
     return backbone
 
 
@@ -97,6 +123,7 @@ class MergeSlide_TTA(nn.Module):
         mode:                 str                     = "tcp",
         all_class_embeddings: Optional[torch.Tensor] = None,
         fixed_task_id:        Optional[int]           = None,
+        param_scope:          str  = "ln_only",
         M:                    int   = 8,
         K_sub:                int   = 300,
         top_ratio:            float = 0.5,
@@ -117,8 +144,11 @@ class MergeSlide_TTA(nn.Module):
         if mode == "task_il":
             assert fixed_task_id is not None, \
                 "fixed_task_id required when mode='task_il'"
+        if param_scope not in ("ln_only", "full"):
+            raise ValueError(f"param_scope must be 'ln_only' or 'full', got: {param_scope}")
 
-        self.backbone             = configure_backbone_for_tta(backbone)
+        self.param_scope          = param_scope
+        self.backbone             = configure_backbone_for_tta(backbone, param_scope)
         self.device               = device
         self.mode                 = mode
         self.task_prompts         = task_prompts.to(device)
@@ -142,12 +172,15 @@ class MergeSlide_TTA(nn.Module):
         self.n_adapted = 0
         self.n_skipped = 0
 
-        ln_params, self.ln_names = collect_ln_params(self.backbone)
-        self.ln_params_anchor: List[torch.Tensor] = [
-            p.detach().clone() for p in ln_params
+        adapt_params, self.adapt_names = collect_adaptation_params(
+            self.backbone, self.param_scope
+        )
+        self.adapt_params_anchor: List[torch.Tensor] = [
+            p.detach().clone() for p in adapt_params
         ]
+        self.ln_params_anchor = self.adapt_params_anchor  # backward-compatible alias
 
-        self.optimizer = torch.optim.Adam(ln_params, lr=lr)
+        self.optimizer = torch.optim.Adam(adapt_params, lr=lr)
 
         self._init_backbone = deepcopy(self.backbone.state_dict())
         self._init_optim    = deepcopy(self.optimizer.state_dict())
@@ -156,10 +189,12 @@ class MergeSlide_TTA(nn.Module):
                      else f"mode=task_il(task={fixed_task_id})")
         num_ln      = len([m for m in self.backbone.modules()
                            if isinstance(m, nn.LayerNorm)])
-        n_ln_params = sum(p.numel() for p in ln_params)
+        n_trainable = sum(p.numel() for p in adapt_params)
+        n_total     = sum(p.numel() for p in self.backbone.parameters())
         print(
             f"[MergeSlide-TTA] {mode_info} | LN layers={num_ln} | "
-            f"LN params={n_ln_params:,} | M={M} sub-bags | K_sub={K_sub} | "
+            f"param_scope={param_scope} | trainable_params={n_trainable:,}/{n_total:,} | "
+            f"M={M} sub-bags | K_sub={K_sub} | "
             f"top_ratio={top_ratio} | alpha={alpha} | beta={beta} | "
             f"lr={lr} | n_steps={n_steps} | episodic={episodic} | "
             f"entropy_threshold={entropy_threshold}"
@@ -262,8 +297,8 @@ class MergeSlide_TTA(nn.Module):
         )
 
         if self.beta > 0:
-            ln_params = [p for p in self.backbone.parameters() if p.requires_grad]
-            reg       = l2_anchor_loss(ln_params, self.ln_params_anchor)
+            adapt_params = [p for p in self.backbone.parameters() if p.requires_grad]
+            reg          = l2_anchor_loss(adapt_params, self.adapt_params_anchor)
             loss      = loss + self.beta * reg
             log["loss/l2_reg"] = reg.item()
 
