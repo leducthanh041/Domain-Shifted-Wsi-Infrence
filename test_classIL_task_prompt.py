@@ -21,6 +21,7 @@ Cấu trúc checkpoint kỳ vọng:
     Merged    : {merge_model_path}/fold_{id}/merged_final.pth
 """
 import argparse
+import csv
 import os
 import time
 from pathlib import Path
@@ -123,6 +124,7 @@ def eval_task_tcp(
     convert_preds_all   = []
     convert_targets_all = []
     times               = []
+    routing_correct     = 0
 
     ps = torch.tensor(TITAN_PS_ARG).int().to(device)
 
@@ -146,6 +148,7 @@ def eval_task_tcp(
             # Bước 1: task routing
             slide_embed  = model.backbone(features, coords, ps)
             pred_task_id = int(torch.argmax(slide_embed @ task_prompts.T))
+            routing_correct += int(pred_task_id == task_id)
 
             # Bước 2: class prediction via MLP head của task dự đoán
             mlp = nn.Linear(EMBED_DIM, num_classes[pred_task_id]).to(device)
@@ -167,7 +170,7 @@ def eval_task_tcp(
     return _pack_results(
         preds_all, targets_all, probs_all,
         convert_preds_all, convert_targets_all, times,
-    )
+    ) + (routing_correct / max(1, len(test_loader)),)
 
 
 def eval_task_naive(
@@ -326,14 +329,24 @@ if __name__ == "__main__":
     parser.add_argument("--mode",             type=str, default="tcp",
                         choices=["tcp", "naive"],
                         help="tcp (default): TCP inference | naive: direct class inference")
+    parser.add_argument(
+        "--result_csv",
+        type=str,
+        default="",
+        help="Optional CSV path to save per-fold/per-task evaluation metrics.",
+    )
     args = parser.parse_args()
 
     local_hot_root = ensure_local_hot_storage()
     args.save_dir = str(resolve_hot_path(args.save_dir, local_hot_root))
     args.merge_model_path = str(resolve_hot_path(args.merge_model_path, local_hot_root))
+    if args.result_csv:
+        args.result_csv = str(resolve_hot_path(args.result_csv, local_hot_root))
     print(f"[INFO] Local hot storage root: {local_hot_root}")
     print(f"[INFO] Finetuned checkpoints: {args.save_dir}")
     print(f"[INFO] Merged checkpoints: {args.merge_model_path}")
+    if args.result_csv:
+        print(f"[INFO] Result CSV: {args.result_csv}")
 
     cfg    = OmegaConf.load(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -365,6 +378,9 @@ if __name__ == "__main__":
     overall_aucs         = []
     overall_times        = []
     all_acc_per_task     = []
+    all_results          = []
+    overall_routing_acc  = []
+    overall_routing_acc_per_task = []
 
     for fold_id in tqdm(range(cfg.training.num_folds), desc="Folds"):
         fold = f"fold_{fold_id}"
@@ -390,6 +406,7 @@ if __name__ == "__main__":
         all_targets_g = []
         acc_per_task  = {}
         fold_time     = 0.0
+        routing_acc_per_task = {}
 
         for task_id in range(num_tasks):
             _, _, test_loader = seq_dataset.get_data_loaders(fold_id, task_id)
@@ -399,12 +416,15 @@ if __name__ == "__main__":
                     test_loader, task_id, model, num_classes,
                     task_prompts, task_model_paths, device,
                 )
+                route_acc = result[-1]
+                result = result[:-1]
             else:
                 result = eval_task_naive(
                     test_loader, task_id, model,
                     task_model_paths, num_classes, device,
                     task_to_global_class=seq_dataset.task_to_global_class,
                 )
+                route_acc = float("nan")
 
             results, preds_all, targets_all, probs_all, \
                 conv_preds, conv_targets, task_time = result
@@ -413,11 +433,32 @@ if __name__ == "__main__":
             num_total   += len(test_loader)
             fold_time   += task_time / len(test_loader)
 
+            task_acc = sum(preds_all == targets_all) / len(test_loader)
+            task_bacc = balanced_accuracy_score(targets_all, preds_all)
             acc_per_task[task_id] = results["/acc"]
-            all_baccs.append(balanced_accuracy_score(targets_all, preds_all))
-            all_accs.append(sum(preds_all == targets_all) / len(test_loader))
+            routing_acc_per_task[task_id] = route_acc
+            all_baccs.append(task_bacc)
+            all_accs.append(task_acc)
             all_preds_g.append(conv_preds)
             all_targets_g.append(conv_targets)
+
+            print(
+                f"  [Fold {fold_id}] Task {task_id} ({seq_dataset.task_names[task_id]}) "
+                f"ACC={task_acc*100:.4f}% BAcc={task_bacc*100:.4f}% "
+                f"routing_acc={route_acc*100:.4f}%"
+            )
+
+            all_results.append({
+                "fold": fold_id,
+                "task_id": task_id,
+                "task_name": seq_dataset.task_names[task_id],
+                "mode": args.mode,
+                "bacc": task_bacc,
+                "acc": task_acc,
+                "n_samples": len(test_loader),
+                "elapsed_s": task_time,
+                "routing_acc": route_acc,
+            })
 
             if len(probs_all.shape) == 3:
                 probs_all = probs_all.squeeze(1)
@@ -445,6 +486,9 @@ if __name__ == "__main__":
         overall_aucs.append(np.array(all_aucs))
         overall_times.append(fold_time / num_tasks)
         all_acc_per_task.append(acc_per_task)
+        valid_routing = [v for v in routing_acc_per_task.values() if not np.isnan(v)]
+        overall_routing_acc.append(np.mean(valid_routing) if valid_routing else float("nan"))
+        overall_routing_acc_per_task.append(routing_acc_per_task)
 
         print(f"[Fold {fold_id}] Acc={np.mean(all_accs)*100:.4f}% "
               f"BAcc={np.mean(all_baccs)*100:.4f}%")
@@ -479,3 +523,31 @@ if __name__ == "__main__":
             accs[t].append(fold_acc[t])
     for t in range(num_tasks):
         print(f"  Task {t}: {np.mean(accs[t])*100:.4f}% ({np.std(accs[t])*100:.4f}%)")
+
+    if args.mode == "tcp":
+        print("\nRouting Accuracy per task (pred_task == true_task):")
+        routing_by_task = {t: [] for t in range(num_tasks)}
+        for fold_r in overall_routing_acc_per_task:
+            for t in range(num_tasks):
+                v = fold_r.get(t, float("nan"))
+                if not np.isnan(v):
+                    routing_by_task[t].append(v)
+        for t in range(num_tasks):
+            vals = routing_by_task[t]
+            if vals:
+                print(f"  Routing Task {t}: {np.mean(vals)*100:.4f}% ({np.std(vals)*100:.4f}%)")
+            else:
+                print(f"  Routing Task {t}: N/A")
+        overall_routing_valid = [v for v in overall_routing_acc if not np.isnan(v)]
+        if overall_routing_valid:
+            print(f"Routing Accuracy (mean): {np.mean(overall_routing_valid)*100:.4f}% "
+                  f"({np.std(overall_routing_valid)*100:.4f}%)")
+
+    if args.result_csv:
+        result_csv_path = Path(args.result_csv)
+        result_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with result_csv_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(all_results[0].keys()))
+            writer.writeheader()
+            writer.writerows(all_results)
+        print(f"\n[INFO] Saved result CSV: {result_csv_path}")

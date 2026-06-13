@@ -19,12 +19,30 @@ PROJECT_ROOT="${PROJECT_ROOT:-/mmlab_students/storageStudents/nguyenvd/Thanhld/W
 USER_NAME="${USER:-thanhld}"
 PROJECT_NAME="$(basename "$PROJECT_ROOT")"
 export MERGESLIDE_LOCAL_ROOT="${MERGESLIDE_LOCAL_ROOT:-/docker/data/$USER_NAME/$PROJECT_NAME}"
-LOG_DIR="${LOG_DIR:-logs}"
+SETTING="${SETTING:-ood}"
+LOG_DIR="${LOG_DIR:-}"
 if [[ "$LOG_DIR" != /* && "$LOG_DIR" != logs && "$LOG_DIR" != logs/* ]]; then
     LOG_DIR="logs/$LOG_DIR"
 fi
-CONFIG_FORWARD="${CONFIG_FORWARD:-configs/default_eval_num_workers0.yaml}"
-#CONFIG_FORWARD="${CONFIG_FORWARD:-configs/default_ood_eval_num_workers0.yaml}"
+if [ -z "$LOG_DIR" ]; then
+    case "$SETTING" in
+        ood) LOG_DIR="logs/my_tta_run/OOD_results/test_new_run" ;;
+        ind) LOG_DIR="logs/my_tta_run/IND_results/test_pt_run" ;;
+        *) echo "[ERROR] Unsupported SETTING=$SETTING (expected ood|ind)" >&2; exit 1 ;;
+    esac
+fi
+case "$SETTING" in
+    ood)
+        CONFIG_FORWARD="${CONFIG_FORWARD:-configs/default_ood_eval_num_workers0.yaml}"
+        SAVE_DIR_FORWARD="${SAVE_DIR_FORWARD:-./checkpoints_ood/finetuned}"
+        MERGE_MODEL_PATH_FORWARD="${MERGE_MODEL_PATH_FORWARD:-./checkpoints_ood/merged}"
+        ;;
+    ind)
+        CONFIG_FORWARD="${CONFIG_FORWARD:-configs/default_eval_num_workers0.yaml}"
+        SAVE_DIR_FORWARD="${SAVE_DIR_FORWARD:-./checkpoints/finetuned}"
+        MERGE_MODEL_PATH_FORWARD="${MERGE_MODEL_PATH_FORWARD:-./checkpoints/merged}"
+        ;;
+esac
 CONFIG_REVERSE="${CONFIG_REVERSE:-configs/default_reverse_eval_num_workers0.yaml}"
 
 CLASSIL_ENTRYPOINT="${CLASSIL_ENTRYPOINT:-tools/run_classil_with_pt_features.py}"
@@ -42,9 +60,10 @@ TTA_N_STEPS="${TTA_N_STEPS:-1}"             # adapt steps/slide
 TTA_PARAM_SCOPE="${TTA_PARAM_SCOPE:-ln_only}"  # ln_only | full
 TTA_ENTROPY_THRESHOLD="${TTA_ENTROPY_THRESHOLD:-0.4}"  # WSI-level filter
 
-TTA_EPISODIC="${TTA_EPISODIC:-1}"
-TTA_VERBOSE_LOSS="${TTA_VERBOSE_LOSS:-0}"
+TTA_EPISODIC="${TTA_EPISODIC:-0}"
+TTA_VERBOSE_LOSS="${TTA_VERBOSE_LOSS:-1}"
 TTA_DIAG_DIR="${TTA_DIAG_DIR:-}"
+TTA_RESULT_CSV="${TTA_RESULT_CSV:-$LOG_DIR/tta_v1_tcp_routing_results.csv}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4}"
 
 # ---------------------------------------------------------------------------
@@ -101,7 +120,12 @@ echo "[INFO] project_root=$PROJECT_ROOT"
 echo "[INFO] python=$PYTHON_BIN"
 echo "[INFO] local_hot_root=$MERGESLIDE_LOCAL_ROOT"
 echo "[INFO] tta_entrypoint=$TTA_ENTRYPOINT"
+echo "[INFO] setting=$SETTING"
 echo "[INFO] log_dir=$LOG_DIR"
+echo "[INFO] config_forward=$CONFIG_FORWARD"
+echo "[INFO] save_dir_forward=$SAVE_DIR_FORWARD"
+echo "[INFO] merge_model_path_forward=$MERGE_MODEL_PATH_FORWARD"
+echo "[INFO] tta_result_csv=$TTA_RESULT_CSV"
 echo "[INFO] cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
 echo "[INFO] tta_variants=$TTA_VARIANTS"
 echo "[INFO] TTA M=$TTA_M | K_sub=$TTA_K_SUB | top_ratio=$TTA_TOP_RATIO | alpha=$TTA_ALPHA | beta=$TTA_BETA | lr=$TTA_LR | n_steps=$TTA_N_STEPS | param_scope=$TTA_PARAM_SCOPE | entropy_threshold=$TTA_ENTROPY_THRESHOLD | reset=$EPISODIC_LABEL | verbose_loss=$TTA_VERBOSE_LOSS"
@@ -113,7 +137,7 @@ fi
 
 supports_arg() {
     local arg_name="$1"
-    grep -q "add_argument(\"$arg_name\"" "$entrypoint_path"
+    grep -q -- "$arg_name" "$entrypoint_path"
 }
 
 # ---------------------------------------------------------------------------
@@ -196,6 +220,13 @@ if [ -n "$TTA_DIAG_DIR" ]; then
         echo "[WARN] $TTA_ENTRYPOINT does not support --diag_dir; skipping TTA_DIAG_DIR=$TTA_DIAG_DIR" >&2
     fi
 fi
+if [ -n "$TTA_RESULT_CSV" ]; then
+    if supports_arg "--result_csv"; then
+        TTA_ARGS+=(--result_csv "$TTA_RESULT_CSV")
+    else
+        echo "[WARN] $TTA_ENTRYPOINT does not support --result_csv; routing CSV will not be saved" >&2
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # 4 variants  mirrors test_classIL.sh (tcp/naive  forward/reverse)
@@ -208,8 +239,8 @@ if variant_enabled tcp; then
         "$LOG_DIR/error_tta_tcp.log" \
         "$PYTHON_BIN" -u "$CLASSIL_ENTRYPOINT" \
             --config           "$CONFIG_FORWARD" \
-            --save_dir         ./checkpoints/finetuned \
-            --merge_model_path ./checkpoints/merged \
+            --save_dir         "$SAVE_DIR_FORWARD" \
+            --merge_model_path "$MERGE_MODEL_PATH_FORWARD" \
             --mode tcp \
             "${TTA_ARGS[@]}"
 fi
